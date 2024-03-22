@@ -11,33 +11,57 @@ from selenium.webdriver.common.action_chains import ActionChains
 from headless_chrome import create_driver
 
 
+def convert_to_csv(data):
+    csv_string = ''
+    header = ','.join(data[0].keys())
+    csv_string += header + '\\n'
+    for entry in data:
+        row = ','.join(str(entry[key]) for key in entry)
+        csv_string += row + '\\n'
+    return csv_string
+
+
 def lambda_handler(event, context):
-    # Retrieve keyword and verbose flag from environment variables
-    keyword = event.get('keyword', 'mumbai')  # default to 'mumbai' if keyword is not provided
-    verbose = event.get('verbose', True)  # default to True if verbose is not provided
-    # Create the headless Chrome/Chromium driver instance
+    keyword = event.get('keyword')
+    verbose = event.get('verbose', False)
+    max_restaurants = event.get('max_restaurants', 0)
+    offset = event.get('offset', 0)
+    
     driver = create_driver()
 
-    # Call the get_restaurants function
-    df = get_restaurants(keyword, verbose, driver)
-
-    s3_client = boto3.client('s3')
-    bucket_name = 'S3_BUCKET_NAME'  #enter your s3 bucket
-    timestamp = int(time.time())
-    file_key = f'data/{keyword}/{timestamp}_restaurants.csv'
-    csv_buffer = df.to_csv(None)
-    s3_client.put_object(Bucket=bucket_name, Key=file_key, Body=csv_buffer)
-
-    # Clean up resources
+    restaurants_data, next_offset = get_restaurants(keyword, verbose, max_restaurants, offset, driver)
+    if restaurants_data:
+        # Create the CSV buffer
+        aws_access_key_id = 'ACCESS_KEY_ID'
+        aws_secret_access_key = 'SECRET_ACCESS_KEY'
+        s3_client = boto3.client('s3', aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key)
+        bucket_name = 'kelly-test-video'
+        timestamp = int(time.time())
+        file_key = f'data/{keyword}/{timestamp}_restaurants.csv'
+        csv_buffer = convert_to_csv(restaurants_data)
+        s3_client.put_object(Bucket=bucket_name, Key=file_key, Body=csv_buffer)
+    else:
+        print("No restaurant data collected.")
     driver.quit()
 
-    return {
-        'statusCode': 200,
-        'body': 'CSV file uploaded to S3 successfully.'
-    }
+    if next_offset is not None and next_offset == max_restaurants:
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': f'{max_restaurants} restaurants data uploaded to S3 successfully.'})
+        }
+    elif next_offset is not None:
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'next_offset': next_offset})
+        }
+    else:
+        return {
+            'statusCode': 200,
+            'body': json.dumps({'message': 'Restaurant data uploaded to S3 successfully.'})
+        }
 
 
-def get_restaurants(keyword, verbose, driver):
+def get_restaurants(keyword, verbose, max_restaurants, offset, driver):
     url = 'https://www.swiggy.com/city/' + keyword
     driver.get(url)
     restaurants = []
@@ -73,7 +97,8 @@ def get_restaurants(keyword, verbose, driver):
 
     rest_links = driver.find_elements(By.XPATH, './/div[@class="sc-gLLvby jXGZuP"]//child::div//child::a')
 
-    for rest_link in rest_links:
+    # Modify the loop to start from the specified offset
+    for idx, rest_link in enumerate(rest_links[offset:], start=offset):
         try:
             action_chains = ActionChains(driver)
             action_chains.key_down(Keys.CONTROL).click(rest_link).key_up(Keys.CONTROL).perform()
@@ -83,8 +108,7 @@ def get_restaurants(keyword, verbose, driver):
             time.sleep(2)
 
             try:
-                print("Progress: ( {} / {})".format(z, len(res_number)))
-                z = z + 1
+                print("Progress: ( {} / {})".format(idx + 1, min(len(res_number), offset + max_restaurants)))
                 try:
                     rest_name_ele = driver.find_element(By.XPATH, ".//p[@class='RestaurantNameAddress_name__2IaTv']")
                 except NoSuchElementException:
@@ -173,8 +197,15 @@ def get_restaurants(keyword, verbose, driver):
                 print(f"Error during window close: {str(e)}")
 
             driver.switch_to.window(driver.window_handles[0])
+
+            # Break the loop if the desired number of restaurants have been scraped
+            if len(restaurants) >= offset + max_restaurants:
+                next_offset = offset + len(restaurants)
+                return restaurants, next_offset
+
         except StaleElementReferenceException:
             time.sleep(5)
             print("StaleElementReferenceException: Element is no longer attached to the DOM. Trying again.")
 
-    return restaurants
+    # If the loop completes without reaching the desired number of restaurants
+    return restaurants, None
